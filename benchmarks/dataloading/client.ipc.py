@@ -16,6 +16,7 @@ import traceback
 from functools  import partial
 from contextlib import nullcontext
 from datetime   import timedelta
+import time
 
 # -- maxie specific imports
 from maxie.datasets.ipc_segmented_dataset_dist import IPCDistributedSegmentedDatasetConfig, IPCDistributedSegmentedDataset, IPCDatasetConfig, IPCDataset
@@ -72,7 +73,6 @@ path_train_json      = dataset_config.get("path_train")
 path_eval_json       = dataset_config.get("path_eval")
 batch_size           = dataset_config.get("batch_size")
 num_workers          = dataset_config.get("num_workers")
-seg_size             = dataset_config.get("seg_size")
 server_address       = dataset_config.get("server_address")
 transforms_config    = dataset_config.get("transforms")
 num_patch            = transforms_config.get("num_patch")
@@ -161,7 +161,7 @@ if uses_dist:
                             world_size  = dist_world_size,
                             timeout     = timedelta(seconds=1800),
                             init_method = "env://",)
-    print(f"RANK:{dist_rank},LOCAL_RANK:{dist_local_rank},WORLD_SIZE:{dist_world_size}")
+    #print(f"RANK:{dist_rank},LOCAL_RANK:{dist_local_rank},WORLD_SIZE:{dist_world_size}")
 else:
     dist_rank       = 0
     dist_local_rank = 0
@@ -177,7 +177,7 @@ seed_offset = dist_rank if uses_unique_world_seed else 0
 # ----------------------------------------------------------------------- #
 #  DATASET
 # ----------------------------------------------------------------------- #
-print(f'[RANK {dist_rank}] Confguring dataset...')
+#print(f'[RANK {dist_rank}] Confguring dataset...')
 # -- Seeding
 base_seed  = 0
 world_seed = base_seed + seed_offset
@@ -195,54 +195,42 @@ transforms = (
 )
 
 # -- Set up training set
-ipc_dataset_train_config = IPCDistributedSegmentedDatasetConfig(
+ipc_dataset_train_config = IPCDatasetConfig(
     path_json             = path_train_json,
-    seg_size              = seg_size,
-    world_size            = dist_world_size,
-    transforms            = transforms,
+    transforms            = (), #transforms,
     is_perf               = True,
     server_address        = tuple(server_address),
-    loads_segment_in_init = False,
 )
-dataset_train = IPCDistributedSegmentedDataset(ipc_dataset_train_config)
+dataset_train = IPCDataset(ipc_dataset_train_config)
+if dist_rank == 0:
+    print(f"Initialized dataset with size: {len(dataset_train)}")
 
 def custom_collate(batch):
     batch_filtered = [x for x in batch if x is not None]
     return torch.cat(batch_filtered, dim=0) if len(batch_filtered) else None
 
 from_resume = path_chkpt_prev is not None
-batch_idx   = 0
+t0 = None
 try:
     # Reset everything for a new epoch if not from a resume
-    if not from_resume:
-        dataset_train.reset()
-    while dataset_train.end_idx < dataset_train.total_size:
-        # -- Prepare training on one micro batch (iteration)
-        # Set next micro batch
-        dataset_train.set_start_idx(dataset_train.end_idx)
+    # Split sampler across ranks
+    sampler = torch.utils.data.DistributedSampler(dataset_train, shuffle=True)
+    # Shuffle the training selection
+    sampler.set_epoch(0)
 
-        if dist_rank == 0:
-            print(f"Working on segment: {dataset_train.start_idx}-{dataset_train.end_idx}; Total size: {dataset_train.total_size}")
+    dataloader = torch.utils.data.DataLoader(dataset_train, batch_size=batch_size, sampler=sampler, num_workers = num_workers, collate_fn=custom_collate)
 
-        # Split sampler across ranks
-        sampler = torch.utils.data.DistributedSampler(dataset_train, shuffle=True)
-        dataloader = torch.utils.data.DataLoader(dataset_train, batch_size=batch_size, sampler=sampler, num_workers = num_workers, collate_fn=custom_collate)
+    dataloader_iter = iter(dataloader)
+    nbytes = 0
+    t0 = time.time()
+    for batch_idx in range(10):
+        with Timer(tag = None, is_on = True) as t:
+            batch_data = next(dataloader_iter)
+            nbytes += batch_data.numel()*batch_data.element_size()
+        loading_time_in_sec = t.duration
 
-        # Shuffle the training example
-        sampler.set_epoch(batch_idx)
+        #print(f"RANK {dist_rank} - Batch idx: {batch_idx:d}, Total time: {loading_time_in_sec:.2f} s, Average time: {loading_time_in_sec / len(batch_data) * 1e3:.2f} ms/event, Batch shape: {batch_data.shape}")
 
-        dataloader_iter = iter(dataloader)
-        while True:
-            try:
-                with Timer(tag = None, is_on = True) as t:
-                    batch_data = next(dataloader_iter)
-                loading_time_in_sec = t.duration
-
-                print(f"RANK {dist_rank} - Batch idx: {batch_idx:d}, Total time: {loading_time_in_sec:.2f} s, Average time: {loading_time_in_sec / len(batch_data) * 1e3:.2f} ms/event, Batch shape: {batch_data.shape}")
-
-                batch_idx += 1
-            except StopIteration:
-                break
 except KeyboardInterrupt:
     print(f"FSDP RANK {dist_rank}: Training was interrupted!")
 except Exception as e:
@@ -253,3 +241,8 @@ finally:
     if dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()
+
+if t0:
+    dt = time.time() - t0
+    nbytes = nbytes / 1024.0**2
+    print(f"RANK {dist_rank}: {nbytes} MB @ {nbytes/dt} MB/sec.")

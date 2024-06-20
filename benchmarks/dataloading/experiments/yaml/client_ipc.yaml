@@ -9,7 +9,6 @@ dataset:
   num_workers: 1
   path_train: experiments/datasets/dataset.train.json
   path_eval: experiments/datasets/dataset.eval.json
-  seg_size: 4
   server_address:
   - localhost
   - 5000
